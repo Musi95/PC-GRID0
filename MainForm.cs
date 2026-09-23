@@ -4,6 +4,7 @@ using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Reflection;
 using System.Text.Json;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -22,7 +23,7 @@ public sealed class MainForm : Form
     // Pattern: https://download.zerotier.com/RELEASES/<version>/dist/ZeroTier%20One.msi
     private const string ZeroTierMsiUrl = "https://download.zerotier.com/RELEASES/1.16.2/dist/ZeroTier%20One.msi";
 
-    private readonly Label _dot;
+    private readonly StatusDot _dot;
     private readonly Label _statusLabel;
     private readonly Label _detailLabel;
     private readonly ProgressBar _progress;
@@ -34,61 +35,57 @@ public sealed class MainForm : Form
     public MainForm()
     {
         Text = "GRID0 Setup";
-        ClientSize = new Size(460, 372);
-        FormBorderStyle = FormBorderStyle.FixedDialog;
-        MaximizeBox = false;
+        ClientSize = new Size(480, 500);
+        MinimumSize = new Size(440, 460);
         StartPosition = FormStartPosition.CenterScreen;
 
-        var title = new Label
+        try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
+
+        var banner = new PictureBox
         {
-            Text = "GRID0",
-            Font = new Font("Segoe UI", 22, FontStyle.Bold),
-            AutoSize = true,
-            Location = new Point(16, 10),
-        };
-        var subtitle = new Label
-        {
-            Text = "Installs ZeroTier and joins the GRID0 network automatically.",
-            AutoSize = true,
-            Location = new Point(18, 50),
+            Dock = DockStyle.Top,
+            Height = 100,
+            BackColor = Color.Black,
+            SizeMode = PictureBoxSizeMode.Zoom,
+            Image = LoadBanner(),
         };
 
-        // Status indicator: colored dot + status text.
-        _dot = new Label
-        {
-            Text = "\u25CF",
-            Font = new Font("Segoe UI", 26, FontStyle.Regular),
-            AutoSize = true,
-            Location = new Point(14, 74),
-            ForeColor = Color.Gray,
-        };
+        _dot = new StatusDot { Location = new Point(16, 118) };
         _statusLabel = new Label
         {
             Text = "Starting...",
             Font = new Font("Segoe UI", 13, FontStyle.Bold),
             AutoSize = true,
-            Location = new Point(52, 84),
+            Location = new Point(44, 116),
         };
         _detailLabel = new Label
         {
             Text = "",
             AutoSize = true,
-            MaximumSize = new Size(424, 40),
-            Location = new Point(18, 122),
+            MaximumSize = new Size(448, 60),
+            Location = new Point(16, 148),
         };
 
         _progress = new ProgressBar
         {
-            Location = new Point(18, 168),
-            Size = new Size(424, 16),
+            Location = new Point(16, 216),
+            Size = new Size(448, 18),
+            Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
             Style = ProgressBarStyle.Marquee,
             Visible = false,
         };
 
+        var logLabel = new Label
+        {
+            Text = "Log:",
+            AutoSize = true,
+            Location = new Point(16, 244),
+        };
         _logBox = new TextBox
         {
-            Location = new Point(18, 192),
-            Size = new Size(424, 124),
+            Location = new Point(16, 266),
+            Size = new Size(448, 168),
+            Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
             Multiline = true,
             ReadOnly = true,
             ScrollBars = ScrollBars.Vertical,
@@ -97,15 +94,60 @@ public sealed class MainForm : Form
         _actionButton = new Button
         {
             Text = "Retry",
-            Location = new Point(342, 326),
-            Size = new Size(100, 32),
+            Size = new Size(92, 30),
+            Location = new Point(372, 448),
+            Anchor = AnchorStyles.Bottom | AnchorStyles.Right,
             Enabled = false,
         };
         _actionButton.Click += async (_, _) => await RunFlowAsync();
 
-        Controls.AddRange(new Control[] { title, subtitle, _dot, _statusLabel, _detailLabel, _progress, _logBox, _actionButton });
+        Controls.AddRange(new Control[] { banner, _dot, _statusLabel, _detailLabel, _progress, logLabel, _logBox, _actionButton });
 
         Shown += async (_, _) => await RunFlowAsync();
+    }
+
+    // The GRID0 banner, embedded in the exe so the single-file build
+    // needs nothing next to it.
+    private static Image? LoadBanner()
+    {
+        try
+        {
+            var asm = Assembly.GetExecutingAssembly();
+            var name = asm.GetManifestResourceNames()
+                .FirstOrDefault(n => n.EndsWith("banner.png", StringComparison.OrdinalIgnoreCase));
+            if (name is null) return null;
+            using var s = asm.GetManifestResourceStream(name);
+            if (s is null) return null;
+            using var tmp = new Bitmap(s);
+            return new Bitmap(tmp);
+        }
+        catch { return null; }
+    }
+
+    // A real painted dot instead of a text glyph, so it stays a crisp
+    // circle at any DPI.
+    private sealed class StatusDot : Control
+    {
+        private Color _color = Color.Gray;
+
+        public StatusDot()
+        {
+            Size = new Size(20, 20);
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
+        }
+
+        public Color DotColor
+        {
+            get => _color;
+            set { _color = value; Invalidate(); }
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            using var brush = new SolidBrush(_color);
+            e.Graphics.FillEllipse(brush, 2, 2, Width - 4, Height - 4);
+        }
     }
 
     private async Task RunFlowAsync()
@@ -314,7 +356,7 @@ public sealed class MainForm : Form
     private void SetStatus(Color color, string text, string detail = "")
     {
         if (InvokeRequired) { Invoke(() => SetStatus(color, text, detail)); return; }
-        _dot.ForeColor = color;
+        _dot.DotColor = color;
         _statusLabel.Text = text;
         _detailLabel.Text = detail;
     }

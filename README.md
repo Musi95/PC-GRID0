@@ -16,6 +16,8 @@ GRID0Setup.csproj
 Program.cs
 MainForm.cs          <- all UI + logic, built in code (no designer files)
 app.manifest         <- requests admin rights (the MSI needs them)
+banner.png           <- GRID0 banner from the GRID0 repo (img/banner.png), shown in the window header
+grid0.ico            <- app icon, cropped from the banner's emblem
 .github/workflows/build.yml
 ```
 
