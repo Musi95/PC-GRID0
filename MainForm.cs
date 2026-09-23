@@ -6,6 +6,7 @@ using System.Linq;
 using System.Net.Http;
 using System.Reflection;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
@@ -31,6 +32,7 @@ public sealed class MainForm : Form
     private readonly Button _actionButton;
 
     private bool _running;
+    private CancellationTokenSource? _monitorCts;
 
     public MainForm()
     {
@@ -99,11 +101,12 @@ public sealed class MainForm : Form
             Anchor = AnchorStyles.Bottom | AnchorStyles.Right,
             Enabled = false,
         };
-        _actionButton.Click += async (_, _) => await RunFlowAsync();
+        _actionButton.Click += async (_, _) => await RetryAsync();
 
         Controls.AddRange(new Control[] { banner, _dot, _statusLabel, _detailLabel, _progress, logLabel, _logBox, _actionButton });
 
         Shown += async (_, _) => await RunFlowAsync();
+        FormClosing += (_, _) => _monitorCts?.Cancel();
     }
 
     // The GRID0 banner, embedded in the exe so the single-file build
@@ -150,12 +153,25 @@ public sealed class MainForm : Form
         }
     }
 
+    private async Task RetryAsync()
+    {
+        // Stop the background monitor, then run the full flow again. The
+        // button is only enabled while no setup is running, so this never
+        // races an in-flight RunFlowAsync.
+        _monitorCts?.Cancel();
+        await RunFlowAsync();
+    }
+
     private async Task RunFlowAsync()
     {
         if (_running) return;
         _running = true;
         _actionButton.Enabled = false;
         _progress.Visible = true;
+        _monitorCts?.Cancel();
+        _monitorCts?.Dispose();
+        _monitorCts = new CancellationTokenSource();
+        var ct = _monitorCts.Token;
 
         try
         {
@@ -191,8 +207,19 @@ public sealed class MainForm : Form
             if (jcode != 0)
                 throw new Exception("Could not join the network. " + jmsg);
 
-            await PollNetworkAsync();
+            if (!await WaitForFirstConnectionAsync(ct))
+            {
+                SetStatus(Color.Orange, "Still not connected",
+                    "Timed out waiting for the network. Press Retry to try again.");
+                return;
+            }
+
+            // Connected. Keep watching in the background so a later
+            // disconnect or network leave updates the status instead of
+            // leaving a stale green dot behind.
+            _ = MonitorNetworkAsync(ct);
         }
+        catch (OperationCanceledException) { }
         catch (Exception ex)
         {
             SetStatus(Color.Red, "Something went wrong", ex.Message);
@@ -206,7 +233,9 @@ public sealed class MainForm : Form
         }
     }
 
-    private async Task PollNetworkAsync()
+    // Waits up to ~3 minutes for the first GRID0 connection. Returns true
+    // once connected, false on timeout.
+    private async Task<bool> WaitForFirstConnectionAsync(CancellationToken ct)
     {
         string? lastSeen = null;
         for (var i = 0; i < 60; i++)
@@ -247,15 +276,66 @@ public sealed class MainForm : Form
                 if (status == "OK")
                 {
                     Log("Connected to the GRID0 network" + (ips.Length > 0 ? " (" + ips + ")" : "") + ".");
-                    return;
+                    return true;
                 }
             }
 
-            await Task.Delay(3000);
+            await Task.Delay(3000, ct);
         }
 
-        SetStatus(Color.Orange, "Still not connected",
-            "Timed out waiting for the network. Press Retry to try again.");
+        return false;
+    }
+
+    // Keeps watching after the first connection so a later disconnect,
+    // network leave, or de-authorization updates the status instead of
+    // leaving a stale green dot behind. Runs until cancelled.
+    private async Task MonitorNetworkAsync(CancellationToken ct)
+    {
+        var lastSeen = "OK";
+        try
+        {
+            while (true)
+            {
+                await Task.Delay(3000, ct);
+                var (cliOk, online, status, ips) = await GetStateAsync();
+
+                if (!cliOk || !online)
+                {
+                    if (lastSeen != "OFFLINE")
+                    {
+                        lastSeen = "OFFLINE";
+                        SetStatus(Color.Red, "ZeroTier is offline",
+                            "The ZeroTier node cannot reach the internet. Check your connection.");
+                        Log("Lost connection: ZeroTier node is offline.");
+                    }
+                }
+                else if (status is null)
+                {
+                    if (lastSeen != "REJOIN")
+                    {
+                        lastSeen = "REJOIN";
+                        Log("Left the GRID0 network, rejoining...");
+                    }
+                    SetStatus(Color.Gray, "Joining the GRID0 network...");
+                    await CliAsync("join " + NetworkId);
+                }
+                else
+                {
+                    if (status != lastSeen)
+                    {
+                        lastSeen = status;
+                        Log("Network status: " + status);
+                    }
+                    UpdateNetworkStatus(status, ips);
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            SetStatus(Color.Red, "Something went wrong", ex.Message);
+            Log("ERROR: " + ex.Message);
+        }
     }
 
     private void UpdateNetworkStatus(string status, string ips)
