@@ -209,52 +209,117 @@ public sealed class MainForm : Form
         string? lastSeen = null;
         for (var i = 0; i < 60; i++)
         {
-            var (code, stdout, _) = await CliAsync("-j listnetworks");
-            if (code == 0)
+            var (cliOk, online, status, ips) = await GetStateAsync();
+
+            if (!cliOk || !online)
             {
-                try
+                // The node cannot reach ZeroTier's roots. listnetworks may
+                // still report a cached "OK" here, so never trust it alone.
+                if (lastSeen != "OFFLINE")
                 {
-                    using var doc = JsonDocument.Parse(stdout);
-                    foreach (var net in doc.RootElement.EnumerateArray())
-                    {
-                        if (net.GetProperty("id").GetString() != NetworkId) continue;
-
-                        var status = net.GetProperty("status").GetString() ?? "UNKNOWN";
-                        if (status != lastSeen)
-                        {
-                            Log("Network status: " + status);
-                            lastSeen = status;
-                        }
-
-                        if (status == "OK")
-                        {
-                            var ips = "";
-                            if (net.TryGetProperty("assignedAddresses", out var addrs))
-                                ips = string.Join(", ", addrs.EnumerateArray()
-                                    .Select(a => a.GetString())
-                                    .Where(s => !string.IsNullOrEmpty(s)));
-                            SetStatus(Color.Green, "Connected to GRID0",
-                                "Network " + NetworkId + (ips.Length > 0 ? "\nYour address: " + ips : ""));
-                            Log("Connected to the GRID0 network" + (ips.Length > 0 ? " (" + ips + ")" : "") + ".");
-                            return;
-                        }
-
-                        if (status == "ACCESS_DENIED")
-                            SetStatus(Color.Orange, "Waiting for authorization",
-                                "You joined the network. An admin still needs to approve your device.");
-                        else
-                            SetStatus(Color.Gray, "Joining the GRID0 network...", "Status: " + status);
-
-                        break;
-                    }
+                    lastSeen = "OFFLINE";
+                    SetStatus(Color.Red, "ZeroTier is offline",
+                        "The ZeroTier node cannot reach the internet. Check your connection.");
+                    Log("ZeroTier node is offline.");
                 }
-                catch (JsonException) { /* bad read, try again next poll */ }
             }
+            else if (status is null)
+            {
+                if (lastSeen != "REJOIN")
+                {
+                    lastSeen = "REJOIN";
+                    Log("Not on the GRID0 network, joining...");
+                }
+                SetStatus(Color.Gray, "Joining the GRID0 network...");
+                await CliAsync("join " + NetworkId);
+            }
+            else
+            {
+                if (status != lastSeen)
+                {
+                    lastSeen = status;
+                    Log("Network status: " + status);
+                }
+                UpdateNetworkStatus(status, ips);
+
+                if (status == "OK")
+                {
+                    Log("Connected to the GRID0 network" + (ips.Length > 0 ? " (" + ips + ")" : "") + ".");
+                    return;
+                }
+            }
+
             await Task.Delay(3000);
         }
 
         SetStatus(Color.Orange, "Still not connected",
             "Timed out waiting for the network. Press Retry to try again.");
+    }
+
+    private void UpdateNetworkStatus(string status, string ips)
+    {
+        if (status == "OK")
+            SetStatus(Color.Green, "Connected to GRID0",
+                "Network " + NetworkId + (ips.Length > 0 ? "\nYour address: " + ips : ""));
+        else if (status == "ACCESS_DENIED")
+            SetStatus(Color.Orange, "Waiting for authorization",
+                "You joined the network. An admin still needs to approve your device.");
+        else
+            SetStatus(Color.Gray, "Joining the GRID0 network...", "Status: " + status);
+    }
+
+    // Reads both the node's online state and the network's membership
+    // state. listnetworks alone is not enough: its "OK" is the cached
+    // membership/config state and stays "OK" even when the node itself
+    // is offline.
+    private static async Task<(bool CliOk, bool NodeOnline, string? NetStatus, string Addresses)> GetStateAsync()
+    {
+        try
+        {
+            var cliOk = false;
+            var online = false;
+
+            var (icode, iout, _) = await CliAsync("-j info");
+            if (icode == 0)
+            {
+                cliOk = true;
+                try
+                {
+                    using var doc = JsonDocument.Parse(iout);
+                    online = doc.RootElement.TryGetProperty("online", out var o) && o.GetBoolean();
+                }
+                catch (JsonException) { }
+            }
+
+            string? status = null;
+            var ips = "";
+            var (lcode, lout, _) = await CliAsync("-j listnetworks");
+            if (lcode == 0)
+            {
+                cliOk = true;
+                try
+                {
+                    using var doc = JsonDocument.Parse(lout);
+                    foreach (var net in doc.RootElement.EnumerateArray())
+                    {
+                        if (net.GetProperty("id").GetString() != NetworkId) continue;
+                        status = net.GetProperty("status").GetString();
+                        if (net.TryGetProperty("assignedAddresses", out var addrs))
+                            ips = string.Join(", ", addrs.EnumerateArray()
+                                .Select(a => a.GetString())
+                                .Where(s => !string.IsNullOrEmpty(s)));
+                        break;
+                    }
+                }
+                catch (JsonException) { }
+            }
+
+            return (cliOk, online, status, ips);
+        }
+        catch
+        {
+            return (false, false, null, "");
+        }
     }
 
     private static async Task<bool> WaitForCliAsync()
