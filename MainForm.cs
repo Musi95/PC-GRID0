@@ -160,8 +160,10 @@ public sealed class MainForm : Form
         try
         {
             SetStatus(Color.Gray, "Checking for ZeroTier...");
-            if (FindCli() is null)
+            if (!await IsZeroTierHealthyAsync())
             {
+                if (FindCli() is not null)
+                    Log("Found a ZeroTier install, but it is not responding. Repairing...");
                 SetStatus(Color.Gray, "Installing ZeroTier...");
                 var msi = await DownloadMsiAsync();
                 Log("Running the ZeroTier installer silently...");
@@ -371,6 +373,23 @@ public sealed class MainForm : Form
             await fs.WriteAsync(buffer.AsMemory(0, n));
         Log("Download complete.");
         return dest;
+    }
+
+    // A leftover zerotier-cli.bat from a broken or partial install is not
+    // enough: the CLI must actually answer. Otherwise a dead install would
+    // make the wizard skip the install step entirely.
+    private static async Task<bool> IsZeroTierHealthyAsync()
+    {
+        if (FindCli() is null) return false;
+        try
+        {
+            var (code, _, _) = await CliAsync("info");
+            return code == 0;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static string? FindCli()
