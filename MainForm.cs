@@ -168,6 +168,7 @@ public sealed class MainForm : Form
         if (_running) return;
         _running = true;
         _actionButton.Enabled = false;
+        _actionButton.Text = "Retry";
         _progress.Visible = true;
         _monitorCts?.Cancel();
         _monitorCts?.Dispose();
@@ -306,6 +307,7 @@ public sealed class MainForm : Form
     private async Task MonitorNetworkAsync(CancellationToken ct)
     {
         var lastSeen = "OK";
+        var nullStreak = 0;
         try
         {
             while (true)
@@ -315,6 +317,7 @@ public sealed class MainForm : Form
 
                 if (!hasInternet)
                 {
+                    nullStreak = 0;
                     if (lastSeen != "NOINET")
                     {
                         lastSeen = "NOINET";
@@ -325,6 +328,7 @@ public sealed class MainForm : Form
                 }
                 else if (!cliOk || !online)
                 {
+                    nullStreak = 0;
                     if (lastSeen != "OFFLINE")
                     {
                         lastSeen = "OFFLINE";
@@ -335,16 +339,25 @@ public sealed class MainForm : Form
                 }
                 else if (status is null)
                 {
-                    if (lastSeen != "REJOIN")
+                    // The network entry vanished: the user left GRID0 (or it
+                    // was removed). Debounce a couple of polls so a transient
+                    // blip does not flash the state, then show disconnected
+                    // and offer Reconnect. No silent auto-rejoin here:
+                    // fighting the user's own leave is hostile UX.
+                    nullStreak++;
+                    if (nullStreak >= 2 && lastSeen != "DISCONNECTED")
                     {
-                        lastSeen = "REJOIN";
-                        Log("Left the GRID0 network, rejoining...");
+                        lastSeen = "DISCONNECTED";
+                        SetStatus(Color.Gray, "Disconnected from GRID0",
+                            "You left the GRID0 network. Press Reconnect to join again.");
+                        _actionButton.Text = "Reconnect";
+                        Log("Disconnected from the GRID0 network.");
                     }
-                    SetStatus(Color.Gray, "Joining the GRID0 network...");
-                    await CliAsync("join " + NetworkId);
                 }
                 else
                 {
+                    nullStreak = 0;
+                    if (lastSeen == "DISCONNECTED") _actionButton.Text = "Retry";
                     if (status != lastSeen)
                     {
                         lastSeen = status;
@@ -374,10 +387,6 @@ public sealed class MainForm : Form
             SetStatus(Color.Gray, "Joining the GRID0 network...", "Status: " + status);
     }
 
-    // Reads both the node's online state and the network's membership
-    // state. listnetworks alone is not enough: its "OK" is the cached
-    // membership/config state and stays "OK" even when the node itself
-    // is offline.
     // Quick ground-truth check for internet access. ZeroTier's own
     // "online" flag and listnetworks both lag behind reality (a cached
     // "OK" can linger for a while after WiFi drops), so we verify
@@ -400,6 +409,10 @@ public sealed class MainForm : Form
         }
     }
 
+    // Reads the node's online state, our own internet reachability, and
+    // the network's membership state. listnetworks alone is not enough:
+    // its "OK" is the cached membership/config state and stays "OK" even
+    // when the node itself is offline.
     private static async Task<(bool CliOk, bool NodeOnline, bool HasInternet, string? NetStatus, string Addresses)> GetStateAsync()
     {
         try
