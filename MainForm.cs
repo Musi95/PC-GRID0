@@ -4,6 +4,7 @@ using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Net.Sockets;
 using System.Reflection;
 using System.Text.Json;
 using System.Threading;
@@ -198,7 +199,7 @@ public sealed class MainForm : Form
             }
 
             if (!await WaitForNodeOnlineAsync())
-                throw new Exception("ZeroTier is installed but the node is offline. Check your internet connection.");
+                throw new Exception("ZeroTier did not come online. Turn your WiFi on and check your internet connection, then press Retry.");
 
             SetStatus(Color.Gray, "Joining the GRID0 network...");
             var (jcode, jout, jerr) = await CliAsync("join " + NetworkId);
@@ -240,9 +241,22 @@ public sealed class MainForm : Form
         string? lastSeen = null;
         for (var i = 0; i < 60; i++)
         {
-            var (cliOk, online, status, ips) = await GetStateAsync();
+            var (cliOk, online, hasInternet, status, ips) = await GetStateAsync();
 
-            if (!cliOk || !online)
+            if (!hasInternet)
+            {
+                // WiFi off, airplane mode, cable unplugged: ZeroTier's own
+                // "online" flag and listnetworks lag behind here, so we
+                // check reachability ourselves and say so plainly.
+                if (lastSeen != "NOINET")
+                {
+                    lastSeen = "NOINET";
+                    SetStatus(Color.Red, "No internet connection",
+                        "Turn your WiFi on. The app will continue automatically.");
+                    Log("No internet connection.");
+                }
+            }
+            else if (!cliOk || !online)
             {
                 // The node cannot reach ZeroTier's roots. listnetworks may
                 // still report a cached "OK" here, so never trust it alone.
@@ -250,7 +264,7 @@ public sealed class MainForm : Form
                 {
                     lastSeen = "OFFLINE";
                     SetStatus(Color.Red, "ZeroTier is offline",
-                        "The ZeroTier node cannot reach the internet. Check your connection.");
+                        "The ZeroTier node cannot reach ZeroTier's servers. Check your connection.");
                     Log("ZeroTier node is offline.");
                 }
             }
@@ -297,15 +311,25 @@ public sealed class MainForm : Form
             while (true)
             {
                 await Task.Delay(3000, ct);
-                var (cliOk, online, status, ips) = await GetStateAsync();
+                var (cliOk, online, hasInternet, status, ips) = await GetStateAsync();
 
-                if (!cliOk || !online)
+                if (!hasInternet)
+                {
+                    if (lastSeen != "NOINET")
+                    {
+                        lastSeen = "NOINET";
+                        SetStatus(Color.Red, "No internet connection",
+                            "Turn your WiFi on. The app will reconnect automatically.");
+                        Log("Lost connection: no internet.");
+                    }
+                }
+                else if (!cliOk || !online)
                 {
                     if (lastSeen != "OFFLINE")
                     {
                         lastSeen = "OFFLINE";
                         SetStatus(Color.Red, "ZeroTier is offline",
-                            "The ZeroTier node cannot reach the internet. Check your connection.");
+                            "The ZeroTier node cannot reach ZeroTier's servers. Check your connection.");
                         Log("Lost connection: ZeroTier node is offline.");
                     }
                 }
@@ -354,14 +378,41 @@ public sealed class MainForm : Form
     // state. listnetworks alone is not enough: its "OK" is the cached
     // membership/config state and stays "OK" even when the node itself
     // is offline.
-    private static async Task<(bool CliOk, bool NodeOnline, string? NetStatus, string Addresses)> GetStateAsync()
+    // Quick ground-truth check for internet access. ZeroTier's own
+    // "online" flag and listnetworks both lag behind reality (a cached
+    // "OK" can linger for a while after WiFi drops), so we verify
+    // reachability ourselves instead of trusting them alone.
+    private static async Task<bool> HasInternetAsync()
     {
         try
         {
+            using var client = new TcpClient();
+            var connected = client.ConnectAsync("1.1.1.1", 443);
+            var winner = await Task.WhenAny(connected, Task.Delay(3000));
+            if (winner != connected) return false;
+            try { await connected; }
+            catch { return false; }
+            return client.Connected;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static async Task<(bool CliOk, bool NodeOnline, bool HasInternet, string? NetStatus, string Addresses)> GetStateAsync()
+    {
+        try
+        {
+            var infoTask = CliAsync("-j info");
+            var netsTask = CliAsync("-j listnetworks");
+            var internetTask = HasInternetAsync();
+            await Task.WhenAll(infoTask, netsTask, internetTask);
+
             var cliOk = false;
             var online = false;
 
-            var (icode, iout, _) = await CliAsync("-j info");
+            var (icode, iout, _) = infoTask.Result;
             if (icode == 0)
             {
                 cliOk = true;
@@ -375,7 +426,7 @@ public sealed class MainForm : Form
 
             string? status = null;
             var ips = "";
-            var (lcode, lout, _) = await CliAsync("-j listnetworks");
+            var (lcode, lout, _) = netsTask.Result;
             if (lcode == 0)
             {
                 cliOk = true;
@@ -396,11 +447,11 @@ public sealed class MainForm : Form
                 catch (JsonException) { }
             }
 
-            return (cliOk, online, status, ips);
+            return (cliOk, online, internetTask.Result, status, ips);
         }
         catch
         {
-            return (false, false, null, "");
+            return (false, false, false, null, "");
         }
     }
 
@@ -418,21 +469,17 @@ public sealed class MainForm : Form
         return false;
     }
 
-    private static async Task<bool> WaitForNodeOnlineAsync()
+    private async Task<bool> WaitForNodeOnlineAsync()
     {
         for (var i = 0; i < 20; i++)
         {
-            var (code, stdout, _) = await CliAsync("-j info");
-            if (code == 0)
-            {
-                try
-                {
-                    using var doc = JsonDocument.Parse(stdout);
-                    if (doc.RootElement.TryGetProperty("online", out var online) && online.GetBoolean())
-                        return true;
-                }
-                catch (JsonException) { }
-            }
+            var (cliOk, online, hasInternet, _, _) = await GetStateAsync();
+            if (cliOk && online && hasInternet) return true;
+            if (cliOk && !hasInternet)
+                SetStatus(Color.Red, "No internet connection",
+                    "Turn your WiFi on. The app will continue automatically.");
+            else
+                SetStatus(Color.Gray, "Waiting for the ZeroTier service...");
             await Task.Delay(3000);
         }
         return false;
